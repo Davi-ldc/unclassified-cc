@@ -3,5 +3,8 @@ dist/
 *.js.map
 .env
 config.yaml
+config.yaml.*
 certs/
 clients/
+todo/
+report/

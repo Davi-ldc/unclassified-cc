@@ -1,22 +1,45 @@
+import { Agent as HttpAgent } from 'http'
+import { Agent as HttpsAgent } from 'https'
 import { HttpsProxyAgent } from 'https-proxy-agent'
-import type { Agent } from 'https'
-import { log } from './logger.js'
 
-let agent: Agent | null = null
+export function bypassProxy(target: URL, noProxy: string): boolean {
+  const hostname = target.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  const port = target.port || (target.protocol === 'https:' ? '443' : '80')
 
-const proxyUrl =
-  process.env.HTTPS_PROXY ||
-  process.env.https_proxy ||
-  process.env.HTTP_PROXY ||
-  process.env.http_proxy ||
-  process.env.ALL_PROXY ||
-  process.env.all_proxy
+  return noProxy.split(/[,\s]+/).some((entry) => {
+    entry = entry.toLowerCase()
+    if (!entry) return false
+    if (entry === '*') return true
+    if (entry === hostname || entry === `[${hostname}]`) return true
 
-if (proxyUrl) {
-  agent = new HttpsProxyAgent(proxyUrl)
-  log('info', `Using proxy: ${proxyUrl}`)
+    const withPort = entry.match(/^(\[[^\]]+\]|[^:]+):(\d+)$/)
+    if (withPort) {
+      if (withPort[2] !== port) return false
+      entry = withPort[1]
+    }
+    entry = entry.replace(/^\[|\]$/g, '')
+    if (entry.startsWith('*.')) entry = entry.slice(1)
+    if (entry.startsWith('.')) {
+      return hostname === entry.slice(1) || hostname.endsWith(entry)
+    }
+    return hostname === entry
+  })
 }
 
-export function getProxyAgent(): Agent | null {
-  return agent
+export function createUpstreamAgent(target: URL, env: NodeJS.ProcessEnv = process.env): HttpAgent {
+  const noProxy = env.no_proxy ?? env.NO_PROXY ?? ''
+  const proxyUrl = target.protocol === 'https:'
+    ? env.https_proxy || env.HTTPS_PROXY || env.http_proxy || env.HTTP_PROXY || env.all_proxy || env.ALL_PROXY
+    : env.http_proxy || env.HTTP_PROXY || env.all_proxy || env.ALL_PROXY
+
+  if (proxyUrl && !bypassProxy(target, noProxy)) {
+    const proxy = new URL(proxyUrl)
+    if (proxy.protocol !== 'http:' && proxy.protocol !== 'https:') {
+      throw new Error('Outbound proxy must use HTTP or HTTPS')
+    }
+    return new HttpsProxyAgent(proxy, { keepAlive: true })
+  }
+  return target.protocol === 'https:'
+    ? new HttpsAgent({ keepAlive: true })
+    : new HttpAgent({ keepAlive: true })
 }

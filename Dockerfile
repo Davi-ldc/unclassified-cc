@@ -1,16 +1,22 @@
-FROM node:22-slim AS builder
+FROM oven/bun:1.4.0-slim AS builder
 WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm install
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --ignore-scripts
 COPY tsconfig.json ./
 COPY src/ src/
-RUN npx tsc
+RUN bun run build
 
-FROM node:22-slim
+FROM oven/bun:1.4.0-slim AS production-deps
+WORKDIR /app
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --production --ignore-scripts
+
+FROM node:24-slim
 WORKDIR /app
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY package.json ./
+COPY --from=production-deps /app/node_modules ./node_modules
+COPY package.json LICENSE ./
+USER node
 
 EXPOSE 8443
 CMD ["node", "dist/index.js", "/app/config.yaml"]

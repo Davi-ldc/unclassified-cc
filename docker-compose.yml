@@ -1,14 +1,21 @@
 services:
   gateway:
     build: .
+    user: "${CC_GATEWAY_UID:-1000}:${CC_GATEWAY_GID:-1000}"
+    environment:
+      CC_GATEWAY_UPSTREAM_API_KEY: "${CC_GATEWAY_UPSTREAM_API_KEY:?Set the server API key in the environment}"
     ports:
-      - "8443:8443"
+      - "127.0.0.1:8443:8443"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
-      - ./certs:/app/certs:ro
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:8443/_health').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8443/_health').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3

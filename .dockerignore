@@ -1,0 +1,10 @@
+.git
+node_modules
+dist
+.env
+config.yaml
+config.yaml.*
+clients
+certs
+todo
+report

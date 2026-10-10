@@ -1,226 +1,459 @@
-import { createServer as createHttpsServer, type ServerOptions } from 'https'
-import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'http'
+import { createServer as createHttpsServer, request as httpsRequest } from 'https'
+import {
+  createServer as createHttpServer,
+  request as httpRequest,
+  type Agent,
+  type ClientRequest,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'http'
 import { readFileSync } from 'fs'
-import { request as httpsRequest } from 'https'
-import { URL } from 'url'
 import type { Config } from './config.js'
-import { authenticate, initAuth } from './auth.js'
-import { getAccessToken } from './oauth.js'
-import { rewriteBody, rewriteHeaders } from './rewriter.js'
+import { createAuthenticator } from './auth.js'
+import { buildUpstreamHeaders } from './headers.js'
+import { BodyError, prepareNeutralRequest, rewriteRequestBody } from './body.js'
+import { WireProfileError, type WireCodec } from './wire-profile.js'
+import { createResponseTransform } from './response.js'
+import { pipeline, type Transform } from 'stream'
+import { createBrotliDecompress, createGunzip, createInflate, createZstdDecompress, brotliDecompress, gunzip, inflate, zstdDecompress } from 'zlib'
+import { promisify } from 'util'
+import { KeyPool, keyFailure, type KeyFailure } from './key-pool.js'
 import { audit, log } from './logger.js'
-import { getProxyAgent } from './proxy-agent.js'
+import { createUpstreamAgent } from './proxy-agent.js'
 
-export function startProxy(config: Config) {
-  initAuth(config)
-
-  const upstream = new URL(config.upstream.url)
-  const useTls = config.server.tls?.cert && config.server.tls?.key
-
-  const handler = (req: IncomingMessage, res: ServerResponse) => {
-    handleRequest(req, res, config, upstream)
+class RequestError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message)
   }
-
-  let server
-  if (useTls) {
-    const tlsOptions: ServerOptions = {
-      cert: readFileSync(config.server.tls.cert),
-      key: readFileSync(config.server.tls.key),
-    }
-    server = createHttpsServer(tlsOptions, handler)
-  } else {
-    server = createHttpServer(handler)
-    log('warn', 'Running without TLS - only use for local development')
-  }
-
-  server.listen(config.server.port, () => {
-    log('info', `CC Gateway listening on ${useTls ? 'https' : 'http'}://0.0.0.0:${config.server.port}`)
-    log('info', `Upstream: ${config.upstream.url}`)
-    log('info', `Canonical device_id: ${config.identity.device_id.slice(0, 8)}...`)
-    log('info', `Authorized clients: ${config.auth.tokens.map(t => t.name).join(', ')}`)
-  })
-
-  return server
 }
 
-async function handleRequest(
+function sendJson(res: ServerResponse, status: number, body: unknown) {
+  if (res.destroyed) return
+  if (res.headersSent) {
+    res.destroy()
+    return
+  }
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'cache-control': 'no-store',
+    ...(status >= 400 ? { connection: 'close' } : {}),
+  })
+  res.end(JSON.stringify(body))
+}
+
+function requestTarget(req: IncomingMessage): { path: string; pathname: string } {
+  const path = req.url || '/'
+  if (!path.startsWith('/') || path.startsWith('//') || /[\\#\s\x00-\x1f\x7f]/.test(path)) {
+    throw new RequestError(400, 'An origin-form request target is required')
+  }
+  return { path, pathname: path.split('?', 1)[0] }
+}
+
+function readBody(req: IncomingMessage, maxBytes: number, timeout: number): Promise<Buffer> {
+  const length = req.headers['content-length']
+  if (length !== undefined && Number(length) > maxBytes) {
+    throw new RequestError(413, 'Request body is too large')
+  }
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    let settled = false
+    const timer = setTimeout(() => fail(408, 'Request body timed out'), timeout)
+    const cleanup = () => {
+      clearTimeout(timer)
+      req.off('data', onData)
+      req.off('end', onEnd)
+      req.off('aborted', onAborted)
+      req.off('error', onError)
+    }
+    const fail = (status: number, message: string) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      chunks.length = 0
+      req.pause()
+      reject(new RequestError(status, message))
+    }
+    const onData = (chunk: Buffer) => {
+      size += chunk.length
+      if (size > maxBytes) {
+        fail(413, 'Request body is too large')
+      } else {
+        chunks.push(chunk)
+      }
+    }
+    const onEnd = () => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(Buffer.concat(chunks, size))
+    }
+    const onAborted = () => fail(400, 'Request body was interrupted')
+    const onError = () => fail(400, 'Could not read request body')
+    req.on('data', onData)
+    req.once('end', onEnd)
+    req.once('aborted', onAborted)
+    req.once('error', onError)
+  })
+}
+
+function responseHeaders(incoming: IncomingMessage) {
+  const headers = { ...incoming.headers }
+  const hopByHop = [
+    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+    'te', 'trailer', 'transfer-encoding', 'upgrade',
+    ...(incoming.headers.connection || '').toLowerCase().split(',').map((name) => name.trim()),
+  ]
+  for (const name of hopByHop) delete headers[name]
+  return headers
+}
+
+const ERROR_PROBE_BYTES = 16 * 1024
+const errorDecoders = {
+  gzip: promisify(gunzip),
+  deflate: promisify(inflate),
+  br: promisify(brotliDecompress),
+  zstd: promisify(zstdDecompress),
+}
+
+async function decodeError(body: Buffer, contentEncoding: string | undefined): Promise<Buffer | undefined> {
+  try {
+    const encodings = (contentEncoding ?? 'identity').toLowerCase().split(',').map(value => value.trim())
+    if (encodings.length > 4) return undefined
+    for (const encoding of encodings.reverse()) {
+      if (encoding === 'identity') continue
+      if (!Object.hasOwn(errorDecoders, encoding)) return undefined
+      body = await errorDecoders[encoding as keyof typeof errorDecoders](body, { maxOutputLength: ERROR_PROBE_BYTES })
+    }
+    return body
+  } catch {
+    return undefined
+  }
+}
+
+// Probe at most one small error envelope. Oversized bodies resume as the original byte stream.
+function inspectError(incoming: IncomingMessage, done: (body?: Buffer) => void): () => void {
+  const chunks: Buffer[] = []
+  let size = 0
+  const cleanup = () => {
+    incoming.off('readable', onReadable)
+    incoming.off('end', onEnd)
+  }
+  const onReadable = () => {
+    while (incoming.readableLength > 0) {
+      const chunk = incoming.read(Math.min(incoming.readableLength, ERROR_PROBE_BYTES + 1 - size)) as Buffer | null
+      if (!chunk) break
+      chunks.push(chunk)
+      size += chunk.length
+      if (size > ERROR_PROBE_BYTES) {
+        cleanup()
+        incoming.unshift(Buffer.concat(chunks, size))
+        done()
+        return
+      }
+    }
+    incoming.read(0)
+  }
+  const onEnd = () => {
+    cleanup()
+    done(Buffer.concat(chunks, size))
+  }
+  incoming.on('readable', onReadable)
+  incoming.once('end', onEnd)
+  return cleanup
+}
+
+function forward(
   req: IncomingMessage,
   res: ServerResponse,
   config: Config,
   upstream: URL,
+  agent: Agent,
+  path: string,
+  body: Buffer,
+  keys: readonly string[],
+  pool: KeyPool,
+  codec?: WireCodec,
 ) {
-  const method = req.method || 'GET'
-  const path = req.url || '/'
-  const clientIp = req.socket.remoteAddress || 'unknown'
-
-  log('info', `← ${method} ${path} from ${clientIp}`)
-
-  // Health check - no auth required
-  if (path === '/_health') {
-    const oauthOk = !!getAccessToken()
-    const status = oauthOk ? 200 : 503
-    res.writeHead(status, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({
-      status: oauthOk ? 'ok' : 'degraded',
-      oauth: oauthOk ? 'valid' : 'expired/refreshing',
-      canonical_device: config.identity.device_id.slice(0, 8) + '...',
-      canonical_platform: config.env.platform,
-      upstream: config.upstream.url,
-      clients: config.auth.tokens.map(t => t.name),
-    }))
+  let attemptHeaders: Record<string, string>[]
+  try {
+    attemptHeaders = keys.map(api_key => buildUpstreamHeaders(req.headersDistinct, { ...config.upstream, api_key }, body.length))
+  } catch {
+    throw new RequestError(400, 'Invalid request headers')
+  }
+  const candidates = pool.candidates()
+  if (candidates.length === 0) {
+    res.setHeader('retry-after', String(pool.retryAfter()))
+    sendJson(res, 503, { error: { type: 'api_error', message: 'Upstream credentials are temporarily unavailable' } })
     return
   }
 
-  // Dry-run verification - shows what would be rewritten (auth required)
-  if (path === '/_verify') {
-    const clientName = authenticate(req)
-    if (!clientName) {
-      res.writeHead(401, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ error: 'Unauthorized' }))
+  let proxyReq: ClientRequest | undefined
+  let proxyRes: IncomingMessage | undefined
+  let cancelInspection: (() => void) | undefined
+  const responseStages: Transform[] = []
+  let settled = false
+  let attempt = 0
+  let cursor = 0
+  // Every attempt shares the same pre-response budget. Streaming retains its idle timeout.
+  const deadline = Date.now() + config.server.upstream_timeout_ms
+  const timer = setTimeout(() => fail(504, 'Upstream timed out'), config.server.upstream_timeout_ms)
+  const cleanup = () => {
+    clearTimeout(timer)
+    cancelInspection?.()
+    req.off('aborted', onAbort)
+    res.off('close', onClose)
+    res.off('finish', onFinish)
+  }
+  const destroyUpstream = () => {
+    cancelInspection?.()
+    cancelInspection = undefined
+    for (const stage of responseStages) stage.destroy()
+    proxyRes?.destroy()
+    proxyReq?.destroy()
+    proxyRes = undefined
+    proxyReq = undefined
+  }
+  const fail = (status: number, message: string) => {
+    if (settled) return
+    settled = true
+    cleanup()
+    destroyUpstream()
+    log('warn', message)
+    sendJson(res, status, { error: { type: 'api_error', message } })
+  }
+  const onAbort = () => {
+    if (settled) return
+    settled = true
+    cleanup()
+    destroyUpstream()
+    res.destroy()
+  }
+  const onClose = () => {
+    if (!res.writableFinished) onAbort()
+  }
+  const onFinish = () => {
+    settled = true
+    cleanup()
+  }
+  req.once('aborted', onAbort)
+  res.once('close', onClose)
+  res.once('finish', onFinish)
+
+  const nextCandidate = (): number | undefined => {
+    while (cursor < candidates.length) {
+      const index = candidates[cursor++]
+      if (pool.available(index)) return index
+    }
+    return undefined
+  }
+
+  const expose = (incoming: IncomingMessage, buffered?: Buffer) => {
+    clearTimeout(timer)
+    cancelInspection?.()
+    cancelInspection = undefined
+    // A fully buffered response has already released its socket, so only a stream needs a new idle timer.
+    if (buffered === undefined) incoming.setTimeout(config.server.upstream_timeout_ms)
+    const headers = responseHeaders(incoming)
+    const contentType = incoming.headers['content-type']?.split(';', 1)[0].trim().toLowerCase()
+    const mode = contentType === 'text/event-stream' ? 'sse' : contentType === 'application/json' ? 'json' : undefined
+    if (codec?.active && mode && (incoming.statusCode ?? 502) < 300) {
+      try {
+        const encodings = (incoming.headers['content-encoding'] ?? 'identity').toLowerCase().split(',').map(value => value.trim())
+        if (encodings.length > 4) throw new Error('Too many content encodings')
+        for (const encoding of encodings.reverse()) {
+          switch (encoding) {
+            case 'identity': break
+            case 'gzip': responseStages.push(createGunzip()); break
+            case 'deflate': responseStages.push(createInflate()); break
+            case 'br': responseStages.push(createBrotliDecompress()); break
+            case 'zstd': responseStages.push(createZstdDecompress()); break
+            default: throw new Error('Unsupported upstream content encoding')
+          }
+        }
+        responseStages.push(createResponseTransform(codec, mode, config.server.max_body_bytes))
+        for (const name of ['content-length', 'content-encoding', 'content-md5', 'digest', 'content-digest', 'repr-digest', 'etag']) delete headers[name]
+        for (const stage of responseStages) stage.once('error', () => fail(502, 'Invalid upstream tool response'))
+        res.writeHead(incoming.statusCode || 502, headers)
+        res.flushHeaders()
+        pipeline([incoming, ...responseStages, res], error => {
+          if (error) fail(502, 'Upstream response translation failed')
+        })
+      } catch {
+        fail(502, 'Unsupported upstream response')
+      }
+    } else {
+      res.writeHead(incoming.statusCode || 502, headers)
+      res.flushHeaders()
+      if (buffered !== undefined) res.end(buffered)
+      else incoming.pipe(res)
+    }
+  }
+
+  const dispatchAttempt = (index: number) => {
+    if (settled || req.aborted || res.destroyed) {
+      onAbort()
       return
     }
-    const sample = buildVerificationPayload(config)
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify(sample, null, 2))
-    return
-  }
-
-  // Authenticate client (proxy-level auth)
-  const clientName = authenticate(req)
-  if (!clientName) {
-    res.writeHead(401, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ error: 'Unauthorized - provide client token via x-api-key header' }))
-    log('warn', `Unauthorized request: ${method} ${path}`)
-    return
-  }
-
-  log('info', `Client "${clientName}" → ${method} ${path}`)
-
-  // Get the real OAuth token (managed by gateway)
-  const oauthToken = getAccessToken()
-  if (!oauthToken) {
-    res.writeHead(503, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ error: 'OAuth token not available - gateway is refreshing' }))
-    log('error', 'No valid OAuth token available')
-    return
-  }
-
-  // Collect request body
-  const chunks: Buffer[] = []
-  for await (const chunk of req) {
-    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
-  }
-  let body = Buffer.concat(chunks)
-
-  // Rewrite identity fields in body
-  if (body.length > 0) {
+    if (Date.now() >= deadline) {
+      fail(504, 'Upstream timed out')
+      return
+    }
+    const id = ++attempt
+    const active = () => !settled && id === attempt
+    const retry = (reason: KeyFailure, retryAfter?: string): boolean => {
+      if (!active() || res.headersSent || req.aborted || res.destroyed) return false
+      pool.defer(index, reason, retryAfter)
+      const next = nextCandidate()
+      if (next === undefined || Date.now() >= deadline) return false
+      // Only positions appear in logs; credentials never do.
+      log('warn', `Upstream credential ${index + 1} unavailable (${reason}); trying credential ${next + 1}`)
+      // Retired sockets may emit errors while the next attempt is already in flight.
+      ++attempt
+      destroyUpstream()
+      dispatchAttempt(next)
+      return true
+    }
+    const networkFailure = (status: number, message: string) => {
+      if (!active()) return
+      if (req.aborted || res.destroyed) { onAbort(); return }
+      if (!res.headersSent && retry('transient')) return
+      fail(status, message)
+    }
     try {
-      body = rewriteBody(body, path, config) as Buffer<ArrayBuffer>
-    } catch (err) {
-      log('error', `Body rewrite failed for ${path}: ${err}`)
+      const request = upstream.protocol === 'https:' ? httpsRequest : httpRequest
+      // The URL owns the destination; the origin-form path is never resolved as a URL.
+      proxyReq = request(upstream, {
+        method: req.method,
+        path,
+        agent,
+        headers: { ...attemptHeaders[index], host: upstream.host },
+      }, (incoming) => {
+        if (!active()) { incoming.destroy(); return }
+        proxyRes = incoming
+        incoming.setTimeout(config.server.upstream_timeout_ms, () => {
+          if (active()) networkFailure(504, 'Upstream timed out')
+        })
+        incoming.once('aborted', () => networkFailure(502, 'Upstream response was interrupted'))
+        incoming.once('error', () => networkFailure(502, 'Upstream response failed'))
+        const status = incoming.statusCode ?? 502
+        const retryAfter = incoming.headers['retry-after']
+        const reason = keyFailure(status)
+        if (reason && retry(reason, retryAfter)) return
+        if (keys.length > 1 && (status === 400 || status === 401)
+          && !(Number(incoming.headers['content-length']) > ERROR_PROBE_BYTES)) {
+          cancelInspection = inspectError(incoming, buffered => {
+            void (async () => {
+              const decoded = buffered === undefined ? undefined : await decodeError(buffered, incoming.headers['content-encoding'])
+              if (!active()) return
+              if (req.aborted || res.destroyed) { onAbort(); return }
+              const reason = keyFailure(status, decoded)
+              if (reason && retry(reason, retryAfter)) return
+              expose(incoming, buffered)
+            })().catch(() => { if (active()) fail(502, 'Upstream response failed') })
+          })
+        } else {
+          expose(incoming)
+        }
+      })
+      proxyReq.once('error', () => networkFailure(502, 'Upstream request failed'))
+      proxyReq.end(body)
+    } catch {
+      networkFailure(502, 'Upstream request failed')
     }
   }
-
-  // Rewrite headers (strips client auth, normalizes identity headers)
-  const rewrittenHeaders = rewriteHeaders(
-    req.headers as Record<string, string | string[] | undefined>,
-    config,
-  )
-
-  // Inject the real OAuth token via x-api-key (Anthropic uses this header for both
-  // API keys and OAuth tokens, distinguished by prefix: sk-ant-api03- vs sk-ant-oat01-)
-  rewrittenHeaders['x-api-key'] = oauthToken
-
-  // Forward to upstream
-  const upstreamUrl = new URL(path, upstream)
-
-  const agent = getProxyAgent()
-  const proxyReq = httpsRequest(
-    upstreamUrl,
-    {
-      method,
-      headers: {
-        ...rewrittenHeaders,
-        host: upstream.host,
-        'content-length': String(body.length),
-      },
-      ...(agent && { agent }),
-    },
-    (proxyRes) => {
-      const status = proxyRes.statusCode || 502
-
-      const responseHeaders = { ...proxyRes.headers }
-      delete responseHeaders['transfer-encoding']
-
-      res.writeHead(status, responseHeaders)
-
-      // Stream response directly (SSE for Claude responses)
-      proxyRes.pipe(res)
-
-      if (config.logging.audit) {
-        audit(clientName, method, path, status)
-      }
-    },
-  )
-
-  proxyReq.on('error', (err) => {
-    log('error', `Upstream error: ${err.message}`)
-    if (!res.headersSent) {
-      res.writeHead(502, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ error: 'Bad gateway', detail: err.message }))
-    }
-    if (config.logging.audit) {
-      audit(clientName, method, path, 502)
-    }
-  })
-
-  proxyReq.write(body)
-  proxyReq.end()
+  dispatchAttempt(nextCandidate()!)
 }
 
-/**
- * Build a sample payload showing what the rewriter produces.
- * Used by /_verify endpoint for admin validation.
- */
-function buildVerificationPayload(config: Config) {
-  // Simulate a /v1/messages request body
-  const sampleInput = {
-    metadata: {
-      user_id: JSON.stringify({
-        device_id: 'REAL_DEVICE_ID_FROM_CLIENT_abc123',
-        account_uuid: 'shared-account-uuid',
-        session_id: 'session-xxx',
-      }),
-    },
-    system: [
-      {
-        type: 'text',
-        text: `x-anthropic-billing-header: cc_version=2.1.81.a1b; cc_entrypoint=cli;`,
-      },
-      {
-        type: 'text',
-        text: `Here is useful information about the environment:\n<env>\nWorking directory: /home/bob/myproject\nPlatform: linux\nShell: bash\nOS Version: Linux 6.5.0-generic\n</env>`,
-      },
-    ],
-    messages: [{ role: 'user', content: 'hello' }],
+export type ProxyOptions = {
+  /** Clock for credential cooldowns; tests inject one to avoid real waiting. */
+  now?: () => number
+}
+
+export function createProxyServer(config: Config, env: NodeJS.ProcessEnv = process.env, options: ProxyOptions = {}) {
+  const upstream = new URL(config.upstream.url)
+  const authenticate = createAuthenticator(config.auth.tokens)
+  // Order is the failover order: the primary key first, then each additional key.
+  const keys = [config.upstream.api_key, ...(config.upstream.fallback_api_keys ?? [])]
+  if (new Set(keys).size !== keys.length) throw new Error('Upstream API keys must be unique')
+  for (const api_key of keys) buildUpstreamHeaders({}, { ...config.upstream, api_key }, 0)
+  // The pool belongs to this server instance and holds deadlines by index, never credentials.
+  const pool = new KeyPool(keys.length, options.now)
+  const agent = createUpstreamAgent(upstream, env)
+
+  const handle = async (req: IncomingMessage, res: ServerResponse) => {
+    const target = requestTarget(req)
+    const prefix = target.pathname === '/agent-v2' || target.pathname.startsWith('/agent-v2/') ? '/agent-v2'
+      : target.pathname === '/agent' || target.pathname.startsWith('/agent/') ? '/agent' : undefined
+    const neutral = prefix !== undefined
+    const profile = prefix === '/agent-v2' ? 'neutral-v2' : 'neutral-v1'
+    const path = prefix ? target.path.slice(prefix.length) || '/' : target.path
+    const pathname = path.split('?', 1)[0]
+    if (!path.startsWith('/') || path.startsWith('//')) throw new RequestError(400, 'Invalid API route')
+    const method = req.method || 'GET'
+    if (pathname === '/_health') {
+      if (method !== 'GET' && method !== 'HEAD') throw new RequestError(405, 'Use GET for health checks')
+      sendJson(res, 200, { status: 'ok' })
+      return
+    }
+
+    const client = authenticate(req)
+    if (!client) {
+      sendJson(res, 401, { error: { type: 'authentication_error', message: 'Invalid gateway credential' } })
+      return
+    }
+    if (pathname === '/_verify') {
+      if (method !== 'GET' && method !== 'HEAD') {
+        sendJson(res, 405, { error: { type: 'invalid_request_error', message: 'Use GET for verification' } })
+        return
+      }
+      const headers = buildUpstreamHeaders({}, config.upstream, 0)
+      headers['x-api-key'] = '[redacted]'
+      sendJson(res, 200, { profile: neutral ? profile : 'opencode-private', headers, body: { remove: 'metadata.user_id', context_attribution: neutral ? 'neutral' : 'CC' } })
+      return
+    }
+    if (!pathname.startsWith('/v1/')) {
+      sendJson(res, 404, { error: { type: 'not_found_error', message: 'Unknown API route' } })
+      return
+    }
+    if (config.logging.audit) {
+      res.once('finish', () => audit(client, method, '/v1/*', res.statusCode))
+    }
+
+    const original = await readBody(req, config.server.max_body_bytes, config.server.request_timeout_ms)
+    const prepared = neutral
+      ? await prepareNeutralRequest(original, pathname, req.headers['content-encoding'], config.server.max_body_bytes, profile)
+      : { body: await rewriteRequestBody(original, pathname, req.headers['content-encoding'], config.server.max_body_bytes), codec: undefined }
+    if (res.destroyed || req.aborted) return
+    forward(req, res, config, upstream, agent, path, prepared.body, keys, pool, prepared.codec)
+  }
+  const handler = (req: IncomingMessage, res: ServerResponse) => {
+    // An unread or aborted request can report a socket error after an early response.
+    req.on('error', () => {})
+    res.on('error', () => res.destroy())
+    void handle(req, res).catch((error: unknown) => {
+      const expected = error instanceof RequestError || error instanceof BodyError || error instanceof WireProfileError
+      const status = expected ? error.status : 500
+      const message = expected ? error.message : 'Gateway request failed'
+      sendJson(res, status, { error: { type: status >= 500 ? 'api_error' : 'invalid_request_error', message } })
+    })
   }
 
-  const rewritten = JSON.parse(
-    rewriteBody(Buffer.from(JSON.stringify(sampleInput)), '/v1/messages', config).toString('utf-8'),
-  )
+  const tls = config.server.tls
+  const server = tls
+    ? createHttpsServer({ cert: readFileSync(tls.cert), key: readFileSync(tls.key) }, handler)
+    : createHttpServer(handler)
+  server.requestTimeout = config.server.request_timeout_ms
+  server.headersTimeout = Math.min(60_000, config.server.request_timeout_ms)
+  server.on('close', () => agent.destroy())
+  return server
+}
 
-  return {
-    _info: 'This shows how the gateway rewrites a sample request',
-    before: {
-      'metadata.user_id': JSON.parse(sampleInput.metadata.user_id),
-      billing_header: sampleInput.system[0].text,
-      system_prompt_env: sampleInput.system[1].text,
-      system_block_count: sampleInput.system.length,
-    },
-    after: {
-      'metadata.user_id': JSON.parse(rewritten.metadata.user_id),
-      billing_header: '(stripped)',
-      system_prompt_env: rewritten.system[0]?.text ?? '(empty)',
-      system_block_count: rewritten.system.length,
-    },
-  }
+export function startProxy(config: Config) {
+  const server = createProxyServer(config)
+  server.listen(config.server.port, config.server.host, () => {
+    const protocol = config.server.tls ? 'https' : 'http'
+    log('info', `CC Gateway listening on ${protocol}://${config.server.host}:${config.server.port}`)
+  })
+  return server
 }

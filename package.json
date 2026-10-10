@@ -1,25 +1,32 @@
 {
-  "name": "cc-gateway",
+  "name": "unclassified-cc",
   "version": "0.2.0",
-  "description": "AI API identity gateway — reverse proxy that normalizes device fingerprints and telemetry for privacy-preserving API proxying",
+  "description": "API-key gateway with an OpenCode-style HTTP privacy profile for Claude Code",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
+  "packageManager": "bun@1.4.0",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
-    "generate-token": "tsx src/scripts/generate-token.ts",
-    "generate-identity": "tsx src/scripts/generate-identity.ts",
-    "test": "tsx tests/rewriter.test.ts"
+    "setup": "bun src/scripts/setup.ts init",
+    "add-client": "bun src/scripts/setup.ts add-client",
+    "generate-token": "bun src/scripts/generate-token.ts",
+    "test": "tsc --project tsconfig.tests.json && tsx --test tests/*.test.ts",
+    "test:client": "tsx tests/client-smoke.ts"
   },
   "dependencies": {
-    "https-proxy-agent": "^9.0.0",
-    "yaml": "^2.7.0"
+    "https-proxy-agent": "^9.1.0",
+    "jsonc-parser": "^3.3.1",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "@types/node": "^24.19.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
   }
 }

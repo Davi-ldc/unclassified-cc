@@ -1,78 +1,24 @@
-# CC Gateway Configuration
-# Copy to config.yaml and modify, or use: bash scripts/quick-setup.sh
-
+# Generate config.yaml and the first client with: bash scripts/quick-setup.sh
+# Supply the real Anthropic API key only through CC_GATEWAY_UPSTREAM_API_KEY.
 server:
+  host: 127.0.0.1
   port: 8443
-  # TLS cert/key paths (required for remote deployment, not needed for localhost)
-  # Generate self-signed: openssl req -x509 -newkey rsa:2048 -keyout certs/key.pem -out certs/cert.pem -days 365 -nodes
+  max_body_bytes: 33554432
+  request_timeout_ms: 120000
+  upstream_timeout_ms: 600000
+  # Remote access requires an intentional bind change and trusted TLS.
   # tls:
   #   cert: ./certs/cert.pem
   #   key: ./certs/key.pem
 
-# Upstream Anthropic API
 upstream:
   url: https://api.anthropic.com
+  user_agent: opencode/1.18.35
 
-# OAuth - gateway manages token lifecycle centrally
-# Extract credentials from macOS Keychain:
-#   security find-generic-password -a "$USER" -s "Claude Code-credentials" -w | python3 -c "import sys,json; d=json.load(sys.stdin)['claudeAiOauth']; print(f'access_token: {d[\"accessToken\"]}\nrefresh_token: {d[\"refreshToken\"]}\nexpires_at: {d[\"expiresAt\"]}')"
-# Or just run: bash scripts/quick-setup.sh (extracts automatically)
-oauth:
-  access_token: "your-access-token-here"
-  refresh_token: "your-refresh-token-here"
-  expires_at: 0
-
-# Authentication - each client gets a unique token
-# Generate tokens: bash scripts/add-client.sh <name>
+# Setup generates random client tokens; this reference has no usable credentials.
 auth:
-  tokens:
-    - name: machine-a
-      token: change-me-token-1
-    - name: machine-b
-      token: change-me-token-2
+  tokens: []
 
-# Canonical identity - all clients will appear as this single device
-# Generate a fresh identity: npm run generate-identity
-identity:
-  device_id: "0000000000000000000000000000000000000000000000000000000000000000"
-  email: "user@example.com"
-
-# Canonical environment fingerprint
-# Should match a real machine's profile to look natural
-env:
-  platform: darwin
-  platform_raw: darwin
-  arch: arm64
-  node_version: v24.3.0
-  terminal: iTerm2.app
-  package_managers: npm,pnpm
-  runtimes: node
-  is_running_with_bun: false
-  is_ci: false
-  is_claude_ai_auth: true
-  version: "2.1.81"
-  version_base: "2.1.81"
-  build_time: "2026-03-20T21:26:18Z"
-  deployment_environment: unknown-darwin
-  vcs: git
-
-# System prompt environment masking
-# These values replace the <env> block in the system prompt text.
-# MUST be consistent with the env section above!
-prompt_env:
-  platform: darwin                    # Must match env.platform
-  shell: zsh                          # Shell name shown in prompt
-  os_version: "Darwin 24.4.0"        # uname -sr output
-  working_dir: /Users/jack/projects   # Canonical home directory path prefix
-
-# Canonical process metrics (should look like a real machine)
-process:
-  constrained_memory: 34359738368  # 32GB - pick a realistic value
-  rss_range: [300000000, 500000000]  # 300-500MB realistic range
-  heap_total_range: [40000000, 80000000]
-  heap_used_range: [100000000, 200000000]
-
-# Logging
 logging:
-  level: info  # debug | info | warn | error
-  audit: true  # log which client made each request
+  level: info
+  audit: false
