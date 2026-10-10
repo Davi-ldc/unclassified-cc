@@ -3,7 +3,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
-  rmSync, statSync, symlinkSync, writeFileSync,
+  rmSync, statSync, symlinkSync, writeFileSync, lstatSync, appendFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
@@ -56,6 +56,8 @@ console.log(JSON.stringify({pid: process.pid, args: process.argv.slice(2), cwd: 
     HOME: directory,
     // An inherited native profile must be replaced, never reused.
     CLAUDE_CONFIG_DIR: join(directory, '.claude'),
+    CC_GATEWAY_NATIVE_CONFIG_DIR: join(directory, '.claude'),
+    CC_GATEWAY_CLAUDE_CONFIG_DIR: join(directory, '.local/share/cc-gateway/claude'),
     XDG_DATA_HOME: join(directory, '.local/share'),
     PATH: `${bin}${delimiter}${process.env.PATH ?? ''}`,
     ANTHROPIC_API_KEY: 'unrelated-api-key',
@@ -259,6 +261,79 @@ test('gateway sessions use a dedicated seeded profile and never touch native Cla
   const relative = spawnSync(launcher, [], { cwd: directory, env: { ...env, CC_GATEWAY_CLAUDE_CONFIG_DIR: 'relative/profile' }, encoding: 'utf8' })
   assert.equal(relative.status, 1)
   assert.match(relative.stderr, /absolute path/)
+})
+
+test('resume sees native transcripts and artifacts without sharing credentials or memory', t => {
+  const directory = fixture(t)
+  const launcher = createSetup(directory)
+  const env = fakeClaude(directory)
+  const native = join(directory, '.claude')
+  const project = join(native, 'projects', '-project')
+  const id = '11111111-2222-4333-8444-555555555555'
+  mkdirSync(join(project, id, 'subagents'), { recursive: true })
+  mkdirSync(join(project, 'memory'))
+  mkdirSync(join(native, 'sessions'))
+  writeFileSync(join(project, `${id}.jsonl`), 'native conversation\n')
+  writeFileSync(join(project, id, 'subagents', 'child.jsonl'), 'child history')
+  writeFileSync(join(project, 'memory', 'MEMORY.md'), 'private memory')
+  writeFileSync(join(native, '.credentials.json'), 'private login')
+  writeFileSync(join(native, 'sessions', 'process.key'), 'private IPC credential')
+  const child = spawnSync(launcher, ['--resume', id], { cwd: directory, env, encoding: 'utf8' })
+  assert.equal(child.status, 0, child.stderr)
+  assert.deepEqual(JSON.parse(child.stdout).args, ['--resume', id])
+  const profile = join(directory, '.local/share/cc-gateway/claude')
+  const linked = join(profile, 'projects', '-project', `${id}.jsonl`)
+  assert.ok(lstatSync(linked).isFile())
+  assert.equal(lstatSync(linked).isSymbolicLink(), false)
+  assert.equal(statSync(linked).ino, statSync(join(project, `${id}.jsonl`)).ino)
+  appendFileSync(join(project, `${id}.jsonl`), 'new native turn\n')
+  assert.equal(readFileSync(linked, 'utf8'), 'native conversation\nnew native turn\n')
+  assert.equal(readFileSync(join(profile, 'projects', '-project', id, 'subagents', 'child.jsonl'), 'utf8'), 'child history')
+  assert.equal(existsSync(join(profile, '.credentials.json')), false)
+  assert.equal(existsSync(join(profile, 'sessions')), false)
+  assert.equal(existsSync(join(profile, 'projects', '-project', 'memory')), false)
+  assert.equal(readFileSync(join(native, '.credentials.json'), 'utf8'), 'private login')
+  assert.equal(spawnSync(launcher, ['--resume'], { cwd: directory, env }).status, 0)
+})
+
+test('history linking preserves API conversations and discovers later native conversations', t => {
+  const directory = fixture(t)
+  const launcher = createSetup(directory)
+  const env = fakeClaude(directory)
+  const source = join(directory, '.claude/projects/-project')
+  const target = join(directory, '.local/share/cc-gateway/claude/projects/-project')
+  mkdirSync(source, { recursive: true })
+  mkdirSync(target, { recursive: true })
+  writeFileSync(join(source, 'shared.jsonl'), 'native version')
+  writeFileSync(join(target, 'shared.jsonl'), 'existing API version')
+  writeFileSync(join(target, 'api-only.jsonl'), 'API conversation')
+  writeFileSync(join(source, 'linked.jsonl'), 'previously linked conversation')
+  symlinkSync(join(source, 'linked.jsonl'), join(target, 'linked.jsonl'))
+  assert.equal(spawnSync(launcher, ['--resume'], { cwd: directory, env }).status, 0)
+  assert.ok(lstatSync(join(target, 'linked.jsonl')).isFile())
+  assert.equal(statSync(join(target, 'linked.jsonl')).ino, statSync(join(source, 'linked.jsonl')).ino)
+  assert.equal(readFileSync(join(target, 'shared.jsonl'), 'utf8'), 'existing API version')
+  assert.equal(readFileSync(join(source, 'shared.jsonl'), 'utf8'), 'native version')
+  assert.equal(readFileSync(join(target, 'api-only.jsonl'), 'utf8'), 'API conversation')
+  writeFileSync(join(source, 'new.jsonl'), 'new native conversation')
+  assert.equal(spawnSync(launcher, ['--resume'], { cwd: directory, env }).status, 0)
+  assert.equal(readFileSync(join(target, 'new.jsonl'), 'utf8'), 'new native conversation')
+})
+
+test('history source can be overridden and nested storage is refused', t => {
+  const directory = fixture(t)
+  const launcher = createSetup(directory)
+  const env = fakeClaude(directory)
+  const native = join(directory, 'custom native profile')
+  mkdirSync(join(native, 'projects', '-project'), { recursive: true })
+  writeFileSync(join(native, 'projects', '-project', 'session.jsonl'), 'custom history')
+  const selected = { ...env, CC_GATEWAY_NATIVE_CONFIG_DIR: native }
+  assert.equal(spawnSync(launcher, ['--resume'], { cwd: directory, env: selected }).status, 0)
+  assert.equal(readFileSync(join(directory, '.local/share/cc-gateway/claude/projects/-project/session.jsonl'), 'utf8'), 'custom history')
+  const nested = spawnSync(launcher, [], { cwd: directory, env: { ...selected, CC_GATEWAY_CLAUDE_CONFIG_DIR: join(native, 'projects', 'nested') }, encoding: 'utf8' })
+  assert.equal(nested.status, 1)
+  assert.match(nested.stderr, /must not contain each other/)
+  assert.equal(readFileSync(join(native, 'projects', '-project', 'session.jsonl'), 'utf8'), 'custom history')
 })
 
 test('refresh-client updates only a recognized launcher and preserves its token', t => {

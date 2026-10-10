@@ -69,12 +69,49 @@ export ANTHROPIC_API_KEY=${shellQuote(token)}
 export ANTHROPIC_BASE_URL=${shellQuote(url)}
 ${flags}
 
-# A gateway session gets its own profile. Sharing a directory with a claude.ai login makes
-# the CLI warn that two credentials are set. The login itself is never read or copied.
+# Keep authentication private, while linking only saved conversations for resume.
+native_profile="\${CC_GATEWAY_NATIVE_CONFIG_DIR:-\${CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
 profile="\${CC_GATEWAY_CLAUDE_CONFIG_DIR:-\${XDG_DATA_HOME:-$HOME/.local/share}/cc-gateway/claude}"
 case "$profile" in /*) ;; *) printf '%s\\n' 'The Claude profile directory must be an absolute path.' >&2; exit 1 ;; esac
+case "$native_profile" in /*) ;; *) printf '%s\\n' 'The native profile directory must be an absolute path.' >&2; exit 1 ;; esac
 mkdir -p -m 700 -- "$profile"
-${seed}export CLAUDE_CONFIG_DIR="$profile"
+${seed}
+if [[ -d "$native_profile/projects" ]]; then
+  source_projects="$(cd -P -- "$native_profile/projects" && pwd)"
+  mkdir -p -m 700 -- "$profile/projects"
+  target_projects="$(cd -P -- "$profile/projects" && pwd)"
+  if [[ "$source_projects" != "$target_projects" ]]; then
+    case "$source_projects/" in "$target_projects/"*) printf '%s\\n' 'History directories must not contain each other.' >&2; exit 1 ;; esac
+    case "$target_projects/" in "$source_projects/"*) printf '%s\\n' 'History directories must not contain each other.' >&2; exit 1 ;; esac
+    for project in "$source_projects"/*; do
+      [[ -d "$project" && ! -L "$project" ]] || continue
+      target="$target_projects/\${project##*/}"
+      [[ ! -L "$target" ]] || continue
+      mkdir -p -m 700 -- "$target"
+      for transcript in "$project"/*.jsonl; do
+        [[ -f "$transcript" && ! -L "$transcript" ]] || continue
+        name="\${transcript##*/}"
+        # The resume picker accepts regular files, not symlinked transcript files.
+        if [[ -L "$target/$name" && "$(readlink -- "$target/$name")" == "$transcript" ]]; then
+          temporary="$target/$name.resume-$$"
+          ln -T -- "$transcript" "$temporary"
+          if [[ -L "$target/$name" && "$(readlink -- "$target/$name")" == "$transcript" ]]; then
+            mv -T -- "$temporary" "$target/$name"
+          else
+            rm -- "$temporary"
+          fi
+        elif [[ ! -e "$target/$name" && ! -L "$target/$name" ]]; then
+          ln -T -- "$transcript" "$target/$name" 2>/dev/null || [[ -e "$target/$name" || -L "$target/$name" ]]
+        fi
+        session="\${name%.jsonl}"
+        if [[ "$session" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ && -d "$project/$session" && ! -L "$project/$session" && ! -e "$target/$session" && ! -L "$target/$session" ]]; then
+          ln -sT -- "$project/$session" "$target/$session" 2>/dev/null || [[ -e "$target/$session" || -L "$target/$session" ]]
+        fi
+      done
+    done
+  fi
+fi
+export CLAUDE_CONFIG_DIR="$profile"
 
 exec claude "$@"
 `
