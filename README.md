@@ -27,6 +27,8 @@ source ./install.sh --list-keys    # shows positions only, never key values
 source ./install.sh --remove-key 2 # removes the key at position 2
 ```
 
+These key-management commands work from another clone too. They update the existing installation without moving its service or `c` command.
+
 ## Everyday commands
 
 ```bash
@@ -36,6 +38,8 @@ git pull && source ./install.sh --reuse-key   # update and restart, keeping the 
 source ./install.sh                     # replace the primary key (hidden prompt)
 echo "$KEY" | ./scripts/install.sh --api-key-stdin   # non-interactive, key from stdin
 ```
+
+To switch an existing installation to a new clone, run `source ./install.sh --reuse-key` there. The installer copies the existing configuration, keeps all API keys and the client token, and points the service and `c` at the new clone. The old files and Claude profile are left intact. A different configuration or unrecognized client launcher in the new clone is refused; if activation fails, the previous installation is restored.
 
 ## Uninstall
 

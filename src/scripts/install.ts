@@ -18,6 +18,8 @@ const MARKER = '# Managed by cc-gateway installer.'
 const DUMMY_KEY = 'installer-schema-validation-only'
 const MAX_FILE = 1024 * 1024
 const TIMEOUT = 5000
+// A restart must outlast the unit's 10-second stop timeout.
+const SYSTEMCTL_TIMEOUT = 20_000
 
 export class InstallError extends Error {}
 function fail(message: string): never { throw new InstallError(message) }
@@ -206,13 +208,21 @@ function systemdUnquote(quoted: string): string {
   const escapes: Record<string, string> = { '\\\\': '\\', '\\"': '"', '%%': '%', '$$': '$' }
   return quoted.slice(1, -1).replace(/\\\\|\\"|%%|\$\$/g, match => escapes[match])
 }
-// A relocated Node runtime is the only supported difference from the current unit template.
 function ownedUnit(source: string, paths: Paths): boolean {
   const match = /^ExecStart=("(?:[^"\\\n]|\\.)*") /m.exec(source)
   if (!match) return false
   const node = systemdUnquote(match[1])
   try { absolutePath(node) } catch { return false }
   return source === renderServiceUnit(paths.root, node, paths.env)
+}
+function installedPaths(source: string, requested: Paths): Paths | undefined {
+  const match = /^WorkingDirectory=(.+)$/m.exec(source)
+  if (!match) return
+  let root: string
+  try { root = absolutePath(match[1].replaceAll('%%', '%')) } catch { return }
+  const paths = { ...requested, root, config: join(root, 'config.yaml'), clients: join(root, 'clients') }
+  // Extracting a path does not establish ownership; the entire unit must match.
+  if (ownedUnit(source, paths) || legacyUnit(source, paths)) return paths
 }
 // The generated header and token line identify a launcher; later launcher revisions are upgraded in place.
 function recognizedLauncher(source: string, token: string): boolean {
@@ -226,7 +236,7 @@ function defaultSystemctl(env: NodeJS.ProcessEnv): InstallAdapters['systemctl'] 
   delete childEnv.ANTHROPIC_API_KEY
   return args => new Promise(resolveResult => {
     execFile('/usr/bin/systemctl', ['--user', '--no-pager', ...args], {
-      env: childEnv, timeout: TIMEOUT, killSignal: 'SIGKILL', maxBuffer: 65536,
+      env: childEnv, timeout: SYSTEMCTL_TIMEOUT, killSignal: 'SIGKILL', maxBuffer: 65536,
     }, (error, stdout) => resolveResult({ code: error ? 1 : 0, stdout: String(stdout) }))
   })
 }
@@ -317,8 +327,13 @@ function checkCommandSearch(paths: Paths, env: NodeJS.ProcessEnv, launcher: stri
     }
   }
 }
-async function inspect(options: InstallOptions, adapters: InstallAdapters): Promise<Plan> {
-  const paths = pathsFor(options)
+async function inspect(options: InstallOptions, adapters: InstallAdapters, lockRoot?: (root: string) => void): Promise<Plan> {
+  const requested = pathsFor(options)
+  checkDirectories(requested.root, true)
+  if (!maybeStat(requested.root)?.isDirectory()) fail('The checkout directory must exist.')
+  const unit = snapshot(requested.unit)
+  const paths = unit ? installedPaths(unit.data!.toString('utf8'), requested) : requested
+  if (!paths) fail('Refusing to overwrite an unrecognized gateway service.')
   for (const path of [paths.root, paths.home, paths.base, paths.secretDir, dirname(paths.unit), dirname(paths.command), paths.clients, dirname(paths.enabledLink)]) checkDirectories(path, true)
   if (!maybeStat(paths.root)?.isDirectory() || !maybeStat(paths.home)?.isDirectory()) fail('The checkout and HOME directories must exist.')
   const realNode = realpathSync(paths.node)
@@ -328,11 +343,9 @@ async function inspect(options: InstallOptions, adapters: InstallAdapters): Prom
     || ![0, process.getuid!()].includes(executable.uid)) fail('The Node executable is not a trusted executable file.')
   const secretDirectory = maybeStat(paths.secretDir)
   if (secretDirectory && (secretDirectory.mode & 0o777) !== 0o700) fail('The credential directory must have mode 700.')
-  const snapshots = new Map<string, Snapshot | undefined>()
-  for (const path of [paths.config, paths.unit, paths.env]) snapshots.set(path, snapshot(path))
-  const unit = snapshots.get(paths.unit)
-  if (unit && !ownedUnit(unit.data!.toString('utf8'), paths)
-    && !legacyUnit(unit.data!.toString('utf8'), paths)) fail('Refusing to overwrite an unrecognized gateway service.')
+  lockRoot?.(paths.root)
+  const snapshots = new Map<string, Snapshot | undefined>([[paths.unit, unit]])
+  for (const path of [paths.config, paths.env]) snapshots.set(path, snapshot(path))
   const keys = snapshots.get(paths.env) ? parseServerKeys(snapshots.get(paths.env)!.data!.toString('utf8')) : []
   const configSource = snapshots.get(paths.config)?.data?.toString('utf8')
   const config = configSource === undefined ? undefined : readConfig(configSource, keys[0])
@@ -471,17 +484,26 @@ export function removeInstallKey(options: InstallOptions, index: number): Promis
   return applyChange(options, '', { kind: 'remove', index })
 }
 async function applyChange(options: InstallOptions, stdinKey: string, action: KeyAction): Promise<void> {
-  let lock: Snapshot | undefined
-  let lockFd: number | undefined
-  try {
-    const paths = pathsFor(options)
-    checkDirectories(paths.root, true)
-    const lockPath = join(paths.root, 'config.yaml.lock')
-    try { lockFd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600) }
+  const locks = new Map<string, { fd: number; file?: Snapshot }>()
+  const acquireLock = (path: string) => {
+    if (locks.has(path)) return
+    checkDirectories(dirname(path), true)
+    let fd: number
+    try { fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600) }
     catch { fail('Another setup operation holds the installation lock.') }
-    lock = snapshot(lockPath)
+    const lock: { fd: number; file?: Snapshot } = { fd }
+    locks.set(path, lock)
+    lock.file = snapshot(path)
+  }
+  const lockRoot = (root: string) => acquireLock(join(root, 'config.yaml.lock'))
+  try {
+    const requested = pathsFor(options)
+    // Every checkout shares the same credentials, service and c command.
+    acquireLock(join(requested.home, '.cc-gateway-install.lock'))
+    if (action.kind === 'apply') lockRoot(requested.root)
     const adapters = adaptersFor(options)
-    const plan = await inspect(options, adapters)
+    const plan = await inspect(options, adapters, lockRoot)
+    const paths = action.kind === 'apply' ? requested : plan.paths
     const supplied = stdinKey.endsWith('\n') ? stdinKey.slice(0, -1) : stdinKey
     if (action.kind !== 'apply') requireInstalled(plan)
     let keys = [...plan.keys]
@@ -495,14 +517,27 @@ async function applyChange(options: InstallOptions, stdinKey: string, action: Ke
     keys = validateKeys(keys)
     const initial = plan.config ? undefined : createSetupFiles(plan.name)
     const token = plan.token ?? initial!.token
-    const config = readConfig(plan.configSource ?? initial!.config, keys[0])
+    const configSource = plan.configSource ?? initial!.config
+    const configData = plan.snapshots.get(plan.paths.config)?.data ?? Buffer.from(configSource)
+    const config = readConfig(configSource, keys[0])
     if (config.auth.tokens.some(entry => keys.includes(entry.token))) fail('Client tokens must differ from all upstream API keys.')
+    const launcher = join(paths.clients, `cc-${plan.name}`)
+    if (paths.root !== plan.paths.root) {
+      checkCommandSearch(paths, options.env ?? process.env, launcher)
+      checkDirectories(paths.clients, true)
+      const destinationConfig = snapshot(paths.config)
+      if (destinationConfig && !destinationConfig.data!.equals(configData)) fail('The destination checkout has a different gateway configuration.')
+      const destinationLauncher = snapshot(launcher)
+      if (destinationLauncher && !recognizedLauncher(destinationLauncher.data!.toString('utf8'), token)) fail('Refusing to overwrite an unrecognized client launcher.')
+      plan.snapshots.set(paths.config, destinationConfig)
+      plan.snapshots.set(launcher, destinationLauncher)
+    }
     const entrypoint = snapshot(join(paths.root, 'dist/index.js'))
     if (!entrypoint) fail('Build the gateway before applying the installation.')
     const changes: Change[] = []
     const created: Snapshot[] = []
     let serviceTouched = false
-    const write = (path: string, data: string, mode: number, target?: string) => {
+    const write = (path: string, data: Buffer | string, mode: number, target?: string) => {
       const before = plan.snapshots.get(path)
       assertUnchanged(path, before)
       if (before && before.target === target && (target !== undefined || (before.data?.equals(Buffer.from(data)) && (before.stat.mode & 0o7777) === mode))) return
@@ -515,9 +550,9 @@ async function applyChange(options: InstallOptions, stdinKey: string, action: Ke
       for (const directory of directories) ensureDirectory(directory, created)
       write(paths.env, renderServerKeys(keys), 0o600)
       if (action.kind === 'apply') {
-        if (initial) write(paths.config, initial.config, 0o600)
-        write(plan.launcher, renderLauncher(token, plan.origin), 0o700)
-        write(paths.command, '', 0o777, plan.launcher)
+        if (!plan.snapshots.get(paths.config)) write(paths.config, configData, 0o600)
+        write(launcher, renderLauncher(token, plan.origin), 0o700)
+        write(paths.command, '', 0o777, launcher)
         write(paths.unit, renderServiceUnit(paths.root, paths.node, paths.env), 0o644)
       }
       serviceTouched = true
@@ -531,9 +566,11 @@ async function applyChange(options: InstallOptions, stdinKey: string, action: Ke
     }
   } catch (error) { throw safeError(error) }
   finally {
-    if (lockFd !== undefined) closeSync(lockFd)
-    if (lock) {
-      try { assertUnchanged(lock.path, lock); unlinkSync(lock.path) } catch { /* A replacement lock belongs to its new owner. */ }
+    for (const { fd, file } of [...locks.values()].reverse()) {
+      closeSync(fd)
+      if (file) {
+        try { assertUnchanged(file.path, file); unlinkSync(file.path) } catch { /* A replacement lock belongs to its new owner. */ }
+      }
     }
   }
 }

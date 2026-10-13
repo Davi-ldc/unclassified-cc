@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import childProcess, { spawnSync, type ExecFileOptions } from 'node:child_process'
 import {
   chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync,
   readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test, type TestContext } from 'node:test'
@@ -77,6 +78,15 @@ function fixture(t: TestContext, specialPaths = false) {
 }
 function tokenAt(config: string): string { return parse(readFileSync(config, 'utf8')).auth.tokens[0].token }
 function mode(path: string): number { return lstatSync(path).mode & 0o777 }
+function anotherCheckout(f: ReturnType<typeof fixture>, name = 'other-checkout') {
+  const root = join(f.directory, name)
+  mkdirSync(join(root, 'dist'), { recursive: true, mode: 0o700 })
+  writeFileSync(join(root, 'dist/index.js'), '// fixture only\n', { mode: 0o600 })
+  return { root, config: join(root, 'config.yaml'), launcher: join(root, 'clients/cc-local'), options: { ...f.options, root } }
+}
+function installationLocks(f: ReturnType<typeof fixture>, root: string): string[] {
+  return [join(f.home, '.cc-gateway-install.lock'), join(f.root, 'config.yaml.lock'), join(root, 'config.yaml.lock')]
+}
 
 test('fresh preflight is read-only and reports only whether a key is present', async t => {
   const f = fixture(t)
@@ -105,6 +115,30 @@ test('fresh installation keeps the upstream key separate and verifies the local 
   assert.deepEqual(f.readiness, [{ origin: 'http://127.0.0.1:8443', token }])
   assert.ok(!JSON.stringify(f.calls).includes(KEY))
   assert.ok(!existsSync(join(f.home, '.claude')))
+})
+
+test('the default systemctl restart deadline outlasts the unit stop timeout', async t => {
+  const f = fixture(t)
+  const systemctl = f.options.adapters!.systemctl!
+  const executions: Array<{ args: string[]; timeout: number | undefined }> = []
+  const mocked = t.mock.method(childProcess, 'execFile', (
+    file: string, args: string[], options: ExecFileOptions, callback: (error: Error | null, stdout: string) => void,
+  ) => {
+    assert.equal(file, '/usr/bin/systemctl')
+    assert.deepEqual(args.slice(0, 2), ['--user', '--no-pager'])
+    executions.push({ args: args.slice(2), timeout: options.timeout })
+    void systemctl(args.slice(2)).then(result => callback(result.code ? new Error('mock systemctl failure') : null, result.stdout))
+  })
+  t.after(() => { mocked.mock.restore(); syncBuiltinESMExports() })
+  syncBuiltinESMExports()
+  delete f.options.adapters!.systemctl
+  await applyInstall(f.options, KEY)
+  await applyInstall(f.options, '')
+  const stopSeconds = Number(/^TimeoutStopSec=(\d+)$/m.exec(readFileSync(f.unit, 'utf8'))?.[1])
+  assert.ok(Number.isFinite(stopSeconds) && stopSeconds > 0)
+  const restarts = executions.filter(call => call.args[0] === 'restart')
+  assert.equal(restarts.length, 2)
+  assert.ok(restarts.every(call => (call.timeout ?? 0) > stopSeconds * 1000))
 })
 
 test('rerun reuses the key and token; rotation changes only the upstream credential', async t => {
@@ -567,4 +601,276 @@ test('PATH entries that cannot hold a command are not treated as conflicts', asy
   f.options.env!.PATH = [join(f.directory, 'missing'), join(file, 'nested')].join(':')
   assert.equal(await preflightInstall(f.options), 'key-required')
   assert.ok(!existsSync(f.config))
+})
+
+test('another checkout can inspect and manage keys without relocating the installation', async t => {
+  for (const legacy of [false, true]) {
+    const f = fixture(t)
+    if (legacy) legacyInstall(f)
+    else await applyInstall(f.options, KEY)
+    const other = anotherCheckout(f)
+    writeFileSync(other.config, 'unrelated configuration\n')
+    unlinkSync(join(other.root, 'dist/index.js'))
+    const launcher = readlinkSync(f.command)
+    const paths = [f.config, launcher, f.unit, other.config]
+    const before = paths.map(path => readFileSync(path))
+    const files = readdirSync(f.directory, { recursive: true })
+    const token = tokenAt(f.config)
+    f.state.occupied = true
+    f.calls.length = 0
+    f.readiness.length = 0
+    assert.equal(await preflightInstall(other.options), 'key-present')
+    assert.deepEqual(await listInstallKeys(other.options), [{ index: 1, role: 'primary' }])
+    assert.deepEqual(readdirSync(f.directory, { recursive: true }), files)
+    assert.ok(f.calls.every(call => call[0] === 'show'))
+    await addInstallKey(other.options, SECOND)
+    assert.deepEqual(parseServerKeys(readFileSync(f.envFile, 'utf8')), [KEY, SECOND])
+    assert.deepEqual(await listInstallKeys(other.options), [{ index: 1, role: 'primary' }, { index: 2, role: 'fallback' }])
+    await removeInstallKey(other.options, 2)
+    assert.deepEqual(parseServerKeys(readFileSync(f.envFile, 'utf8')), [KEY])
+    paths.forEach((path, index) => assert.deepEqual(readFileSync(path), before[index]))
+    assert.equal(readlinkSync(f.command), launcher)
+    assert.ok(!existsSync(join(other.root, 'clients')))
+    assert.ok(f.calls.every(call => call[0] !== 'enable'))
+    assert.ok(f.readiness.every(entry => entry.origin === 'http://127.0.0.1:8443' && entry.token === token))
+    for (const lock of installationLocks(f, other.root)) assert.ok(!existsSync(lock))
+  }
+})
+
+test('apply from another checkout preserves configuration, client identity and fallback keys', async t => {
+  for (const kind of ['modern', 'legacy', 'escaped']) {
+    const f = fixture(t, kind === 'escaped')
+    let launcher: string
+    if (kind === 'legacy') launcher = legacyInstall(f)
+    else {
+      launcher = createSetup(f.root, 'wsl')
+      mkdirSync(dirname(f.command), { recursive: true, mode: 0o700 })
+      symlinkSync(launcher, f.command)
+      await applyInstall(f.options, KEY)
+    }
+    const config = parse(readFileSync(f.config, 'utf8'))
+    const token = config.auth.tokens[0].token
+    config.server.port = 9234
+    config.upstream.url = 'https://example.invalid'
+    const source = `# preserve this formatting\n${stringify(config)}`
+    writeFileSync(f.config, source)
+    writeFileSync(launcher, renderLauncher(token, 'http://127.0.0.1:9234'))
+    await addInstallKey(f.options, SECOND)
+    const oldLauncher = readFileSync(launcher)
+    const oldKeys = readFileSync(f.envFile)
+    const other = anotherCheckout(f, kind === 'escaped' ? 'new checkout with \'"$%\\ chars' : 'other-checkout')
+    const movedNode = join(f.directory, 'new node "$%\\ runtime')
+    writeFileSync(movedNode, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+    other.options.node = movedNode
+    const destination = join(other.root, 'clients/cc-wsl')
+    f.state.occupied = true
+    f.readiness.length = 0
+    assert.equal(await preflightInstall(other.options), 'key-present')
+    await applyInstall(other.options, '')
+    assert.equal(readFileSync(other.config, 'utf8'), source)
+    assert.equal(readFileSync(f.config, 'utf8'), source)
+    assert.deepEqual(readFileSync(launcher), oldLauncher)
+    assert.deepEqual(readFileSync(f.envFile), oldKeys)
+    assert.deepEqual(parseServerKeys(readFileSync(f.envFile, 'utf8')), [KEY, SECOND])
+    assert.equal(readFileSync(destination, 'utf8'), renderLauncher(token, 'http://127.0.0.1:9234'))
+    assert.equal(readlinkSync(f.command), destination)
+    assert.equal(readFileSync(f.unit, 'utf8'), renderServiceUnit(other.root, movedNode, f.envFile))
+    assert.equal(mode(other.config), 0o600)
+    assert.equal(mode(destination), 0o700)
+    assert.ok(!existsSync(other.launcher))
+    assert.ok(f.readiness.every(entry => entry.origin === 'http://127.0.0.1:9234' && entry.token === token))
+    await applyInstall(other.options, '')
+    assert.equal(readFileSync(other.config, 'utf8'), source)
+    assert.equal(readlinkSync(f.command), destination)
+    assert.equal(f.state.active, true)
+    assert.equal(f.state.enabled, true)
+    for (const lock of installationLocks(f, other.root)) assert.ok(!existsSync(lock))
+  }
+})
+
+test('relocation accepts an identical destination config and a matching launcher revision', async t => {
+  const f = fixture(t)
+  await applyInstall(f.options, KEY)
+  const other = anotherCheckout(f)
+  const config = readFileSync(f.config)
+  const token = tokenAt(f.config)
+  writeFileSync(other.config, config, { mode: 0o600 })
+  mkdirSync(dirname(other.launcher), { recursive: true, mode: 0o700 })
+  writeFileSync(other.launcher, renderLauncher(token, 'http://127.0.0.1:8443').replace('exec claude "$@"', 'exec claude --older-revision "$@"'))
+  await applyInstall(other.options, '')
+  assert.deepEqual(readFileSync(other.config), config)
+  assert.equal(readFileSync(other.launcher, 'utf8'), renderLauncher(token, 'http://127.0.0.1:8443'))
+  assert.equal(readlinkSync(f.command), other.launcher)
+})
+
+test('relocation does not overwrite conflicting destination files', async t => {
+  for (const target of ['config', 'launcher', 'config-symlink']) {
+    const f = fixture(t)
+    await applyInstall(f.options, KEY)
+    const other = anotherCheckout(f)
+    const path = target === 'launcher' ? other.launcher : other.config
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+    if (target === 'config-symlink') symlinkSync(f.config, path)
+    else writeFileSync(path, target === 'launcher' ? renderLauncher('foreign-client-token', 'http://127.0.0.1:8443') : 'unrelated configuration\n')
+    const sourcePaths = [f.config, f.launcher, f.unit, f.envFile, path]
+    const before = sourcePaths.map(file => readFileSync(file))
+    f.calls.length = 0
+    await assert.rejects(applyInstall(other.options, ''), InstallError)
+    sourcePaths.forEach((file, index) => assert.deepEqual(readFileSync(file), before[index]))
+    assert.equal(readlinkSync(f.command), f.launcher)
+    assert.ok(f.calls.every(call => call[0] === 'show'))
+    if (target === 'config-symlink') assert.ok(lstatSync(path).isSymbolicLink())
+    if (target === 'launcher') assert.ok(!existsSync(other.config))
+    else assert.ok(!existsSync(other.launcher))
+    for (const lock of installationLocks(f, other.root)) assert.ok(!existsSync(lock))
+  }
+})
+
+test('another checkout still rejects foreign services, source files and mismatched launchers', async t => {
+  for (const target of ['unit', 'fragment', 'drop-in', 'command', 'launcher', 'config-symlink']) {
+    const f = fixture(t)
+    await applyInstall(f.options, KEY)
+    const other = anotherCheckout(f)
+    if (target === 'unit') writeFileSync(f.unit, readFileSync(f.unit, 'utf8').replace('Restart=on-failure', 'Restart=always'))
+    if (target === 'fragment') f.state.fragment = '/foreign/cc-gateway.service'
+    if (target === 'drop-in') f.state.dropIns = '/foreign/override.conf'
+    if (target === 'command') {
+      mkdirSync(dirname(other.launcher), { recursive: true, mode: 0o700 })
+      writeFileSync(other.launcher, readFileSync(f.launcher))
+      unlinkSync(f.command)
+      symlinkSync(other.launcher, f.command)
+    }
+    if (target === 'launcher') writeFileSync(f.launcher, renderLauncher('foreign-client-token', 'http://127.0.0.1:8443'))
+    if (target === 'config-symlink') {
+      const saved = join(f.root, 'saved-config.yaml')
+      renameSync(f.config, saved)
+      symlinkSync(saved, f.config)
+    }
+    const paths = [f.unit, f.envFile, f.config, f.launcher]
+    const before = paths.map(path => readFileSync(path))
+    const command = readlinkSync(f.command)
+    await assert.rejects(preflightInstall(other.options), InstallError)
+    await assert.rejects(applyInstall(other.options, ''), InstallError)
+    paths.forEach((path, index) => assert.deepEqual(readFileSync(path), before[index]))
+    assert.equal(readlinkSync(f.command), command)
+    assert.ok(!existsSync(other.config))
+    for (const lock of installationLocks(f, other.root)) assert.ok(!existsSync(lock))
+  }
+})
+
+test('failed relocation restores the source installation and removes only newly created destination files', async t => {
+  for (const failure of ['restart', 'readiness']) {
+    const f = fixture(t)
+    await applyInstall(f.options, KEY)
+    const other = anotherCheckout(f)
+    chmodSync(f.envFile, 0o640)
+    chmodSync(f.launcher, 0o500)
+    const paths = [f.config, f.launcher, f.unit, f.envFile]
+    const before = paths.map(path => ({ data: readFileSync(path), mode: mode(path) }))
+    const locks = installationLocks(f, other.root)
+    let restarts = 0
+    f.state.occupied = true
+    f.state.onRestart = () => {
+      for (const lock of locks) assert.ok(existsSync(lock))
+      restarts++
+      f.state.failRestart = failure === 'restart' && restarts === 1
+      f.state.healthy = failure !== 'readiness' || restarts !== 1
+    }
+    await assert.rejects(applyInstall(other.options, ROTATED), /service operation failed|readiness/)
+    paths.forEach((path, index) => {
+      assert.deepEqual(readFileSync(path), before[index].data)
+      assert.equal(mode(path), before[index].mode)
+    })
+    assert.equal(readlinkSync(f.command), f.launcher)
+    assert.ok(!existsSync(other.config))
+    assert.ok(!existsSync(join(other.root, 'clients')))
+    assert.ok(existsSync(join(other.root, 'dist/index.js')))
+    assert.equal(restarts, 2)
+    assert.equal(f.state.active, true)
+    assert.equal(f.state.enabled, true)
+    for (const lock of locks) assert.ok(!existsSync(lock))
+  }
+})
+
+test('cross-checkout updates respect the shared lock and both setup locks', async t => {
+  for (const index of [0, 1, 2]) {
+    const f = fixture(t)
+    await applyInstall(f.options, KEY)
+    const other = anotherCheckout(f)
+    const locks = installationLocks(f, other.root)
+    writeFileSync(locks[index], 'another operation', { mode: 0o600 })
+    const paths = [f.config, f.launcher, f.unit, f.envFile]
+    const before = paths.map(path => readFileSync(path))
+    await assert.rejects(applyInstall(other.options, ''), /lock/)
+    if (index === 2) {
+      await addInstallKey(other.options, SECOND)
+      await removeInstallKey(other.options, 2)
+    } else await assert.rejects(addInstallKey(other.options, SECOND), /lock/)
+    assert.equal(readFileSync(locks[index], 'utf8'), 'another operation')
+    for (const [i, lock] of locks.entries()) if (i !== index) assert.ok(!existsSync(lock))
+    paths.forEach((path, i) => assert.deepEqual(readFileSync(path), before[i]))
+    assert.equal(readlinkSync(f.command), f.launcher)
+    assert.ok(!existsSync(other.config))
+  }
+})
+
+test('lock cleanup preserves a replacement owned by another operation', async t => {
+  for (const index of [0, 1, 2]) {
+    const f = fixture(t)
+    await applyInstall(f.options, KEY)
+    const other = anotherCheckout(f)
+    const locks = installationLocks(f, other.root)
+    f.state.onRestart = () => {
+      for (const lock of locks) assert.ok(existsSync(lock))
+      const replacement = join(f.directory, 'replacement-lock')
+      writeFileSync(replacement, 'another operation', { mode: 0o600 })
+      renameSync(replacement, locks[index])
+    }
+    await applyInstall(other.options, '')
+    assert.equal(readFileSync(locks[index], 'utf8'), 'another operation')
+    for (const [i, lock] of locks.entries()) if (i !== index) assert.ok(!existsSync(lock))
+    assert.equal(readlinkSync(f.command), other.launcher)
+  }
+})
+
+test('relocation preserves configuration bytes without UTF-8 normalization', async t => {
+  for (const existing of [false, true]) await t.test(existing ? 'identical destination' : 'new destination', async t => {
+    const f = fixture(t)
+    await applyInstall(f.options, KEY)
+    const source = Buffer.concat([Buffer.from('# comment '), Buffer.from([0xff]), Buffer.from('\n'), readFileSync(f.config)])
+    writeFileSync(f.config, source)
+    const other = anotherCheckout(f)
+    if (existing) writeFileSync(other.config, source, { mode: 0o600 })
+    assert.equal(await preflightInstall(other.options), 'key-present')
+    await applyInstall(other.options, '')
+    assert.deepEqual(readFileSync(other.config), source)
+    assert.deepEqual(readFileSync(f.config), source)
+    assert.equal(readlinkSync(f.command), other.launcher)
+  })
+})
+
+test('relocation refuses a PATH alias that would keep pointing at the old launcher', async t => {
+  const f = fixture(t)
+  await applyInstall(f.options, KEY)
+  const other = anotherCheckout(f)
+  const bin = join(f.directory, 'extra-bin')
+  mkdirSync(bin, { mode: 0o700 })
+  const alias = join(bin, 'c')
+  symlinkSync(f.launcher, alias)
+  f.options.env!.PATH = bin
+  assert.equal(await preflightInstall(other.options), 'key-present')
+  assert.deepEqual(await listInstallKeys(other.options), [{ index: 1, role: 'primary' }])
+  const paths = [f.config, f.launcher, f.unit, f.envFile]
+  const before = paths.map(path => readFileSync(path))
+  f.calls.length = 0
+  await assert.rejects(applyInstall(other.options, ''), /Another c command/)
+  paths.forEach((path, index) => assert.deepEqual(readFileSync(path), before[index]))
+  assert.equal(readlinkSync(alias), f.launcher)
+  assert.equal(readlinkSync(f.command), f.launcher)
+  assert.ok(!existsSync(other.config))
+  assert.ok(!existsSync(join(other.root, 'clients')))
+  assert.ok(f.calls.every(call => call[0] === 'show'))
+  assert.equal(await preflightInstall(other.options), 'key-present')
+  assert.deepEqual(await listInstallKeys(other.options), [{ index: 1, role: 'primary' }])
+  for (const lock of installationLocks(f, other.root)) assert.ok(!existsSync(lock))
 })
