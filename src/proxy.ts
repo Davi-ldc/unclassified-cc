@@ -11,6 +11,7 @@ import { readFileSync } from 'fs'
 import type { Config } from './config.js'
 import { createAuthenticator } from './auth.js'
 import { buildUpstreamHeaders } from './headers.js'
+import { OPUS_FAST_BETA, OPUS_FAST_MODEL } from './inference.js'
 import { BodyError, prepareNeutralRequest, rewriteRequestBody } from './body.js'
 import { WireProfileError, type WireCodec } from './wire-profile.js'
 import { createResponseTransform } from './response.js'
@@ -174,10 +175,15 @@ function forward(
   keys: readonly string[],
   pool: KeyPool,
   codec?: WireCodec,
+  opusFast = false,
 ) {
   let attemptHeaders: Record<string, string>[]
   try {
-    attemptHeaders = keys.map(api_key => buildUpstreamHeaders(req.headersDistinct, { ...config.upstream, api_key }, body.length))
+    attemptHeaders = keys.map(api_key => {
+      const headers = buildUpstreamHeaders(req.headersDistinct, { ...config.upstream, api_key }, body.length)
+      if (opusFast && path.split('?', 1)[0] === '/v1/messages') headers['anthropic-beta'] = OPUS_FAST_BETA
+      return headers
+    })
   } catch {
     throw new RequestError(400, 'Invalid request headers')
   }
@@ -383,10 +389,10 @@ export function createProxyServer(config: Config, env: NodeJS.ProcessEnv = proce
 
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
     const target = requestTarget(req)
-    const prefix = target.pathname === '/agent-v2' || target.pathname.startsWith('/agent-v2/') ? '/agent-v2'
-      : target.pathname === '/agent' || target.pathname.startsWith('/agent/') ? '/agent' : undefined
+    const prefix = ['/opus-fast', '/agent-v2', '/agent'].find(value => target.pathname === value || target.pathname.startsWith(value + '/'))
+    const opusFast = prefix === '/opus-fast'
     const neutral = prefix !== undefined
-    const profile = prefix === '/agent-v2' ? 'neutral-v2' : 'neutral-v1'
+    const profile = prefix === '/agent' ? 'neutral-v1' : 'neutral-v2'
     const path = prefix ? target.path.slice(prefix.length) || '/' : target.path
     const pathname = path.split('?', 1)[0]
     if (!path.startsWith('/') || path.startsWith('//')) throw new RequestError(400, 'Invalid API route')
@@ -409,12 +415,15 @@ export function createProxyServer(config: Config, env: NodeJS.ProcessEnv = proce
       }
       const headers = buildUpstreamHeaders({}, config.upstream, 0)
       headers['x-api-key'] = '[redacted]'
-      sendJson(res, 200, { profile: neutral ? profile : 'opencode-private', headers, body: { remove: 'metadata.user_id', context_attribution: neutral ? 'neutral' : 'CC' } })
+      sendJson(res, 200, { profile: neutral ? profile : 'opencode-private', headers, body: { remove: 'metadata.user_id', context_attribution: neutral ? 'neutral' : 'CC' }, ...(opusFast && { inference: { model: OPUS_FAST_MODEL, speed: 'fast', beta: OPUS_FAST_BETA } }) })
       return
     }
     if (!pathname.startsWith('/v1/')) {
       sendJson(res, 404, { error: { type: 'not_found_error', message: 'Unknown API route' } })
       return
+    }
+    if (opusFast && pathname !== '/v1/messages' && pathname !== '/v1/messages/count_tokens' && !pathname.startsWith('/v1/models')) {
+      throw new RequestError(400, 'The Opus Fast endpoint only supports Messages, token counting, and model discovery')
     }
     if (config.logging.audit) {
       res.once('finish', () => audit(client, method, '/v1/*', res.statusCode))
@@ -422,10 +431,10 @@ export function createProxyServer(config: Config, env: NodeJS.ProcessEnv = proce
 
     const original = await readBody(req, config.server.max_body_bytes, config.server.request_timeout_ms)
     const prepared = neutral
-      ? await prepareNeutralRequest(original, pathname, req.headers['content-encoding'], config.server.max_body_bytes, profile)
+      ? await prepareNeutralRequest(original, pathname, req.headers['content-encoding'], config.server.max_body_bytes, profile, opusFast)
       : { body: await rewriteRequestBody(original, pathname, req.headers['content-encoding'], config.server.max_body_bytes), codec: undefined }
     if (res.destroyed || req.aborted) return
-    forward(req, res, config, upstream, agent, path, prepared.body, keys, pool, prepared.codec)
+    forward(req, res, config, upstream, agent, path, prepared.body, keys, pool, prepared.codec, opusFast)
   }
   const handler = (req: IncomingMessage, res: ServerResponse) => {
     // An unread or aborted request can report a socket error after an early response.

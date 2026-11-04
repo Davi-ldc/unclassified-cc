@@ -7,12 +7,18 @@ import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { parseDocument, stringify } from 'yaml'
 import { parseConfig } from '../config.js'
+import { OPUS_FAST_MODEL } from '../inference.js'
 
 const DEFAULT_GATEWAY = 'http://127.0.0.1:8443'
 const CLIENT_FLAGS = {
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-  CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
-  CLAUDE_CODE_DISABLE_FAST_MODE: '1',
+  CLAUDE_CODE_SKIP_FAST_MODE_NETWORK_ERRORS: '1',
+  ANTHROPIC_MODEL: OPUS_FAST_MODEL,
+  ANTHROPIC_DEFAULT_OPUS_MODEL: OPUS_FAST_MODEL,
+  ANTHROPIC_DEFAULT_SONNET_MODEL: OPUS_FAST_MODEL,
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: OPUS_FAST_MODEL,
+  ANTHROPIC_SMALL_FAST_MODEL: OPUS_FAST_MODEL,
+  CLAUDE_CODE_SUBAGENT_MODEL: OPUS_FAST_MODEL,
   CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1',
   CLAUDE_CODE_GATEWAY_HINT_HEADERS: '0',
   CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
@@ -47,7 +53,7 @@ function shellQuote(value: string): string {
 
 export function renderLauncher(token: string, gateway: string): string {
   if (!token || /[\x00-\x20\x7f]/.test(token)) throw new Error('Client token must be nonempty and contain no whitespace or control characters')
-  const url = `${normalizeGateway(gateway)}/agent-v2`
+  const url = `${normalizeGateway(gateway)}/opus-fast`
   const flags = Object.entries(CLIENT_FLAGS).map(([name, value]) => `export ${name}=${value}`).join('\n')
   // The CLI records which API keys the user approved by their last 20 characters.
   // Only a plain suffix is embedded, so the seeded JSON can never be malformed.
@@ -65,6 +71,7 @@ set -euo pipefail
 unset ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CC_GATEWAY_UPSTREAM_API_KEY
 unset ANTHROPIC_CUSTOM_HEADERS CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
 unset CLAUDE_CODE_ENABLE_TELEMETRY NODE_TLS_REJECT_UNAUTHORIZED
+unset CLAUDE_CODE_DISABLE_FAST_MODE CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
 export ANTHROPIC_API_KEY=${shellQuote(token)}
 export ANTHROPIC_BASE_URL=${shellQuote(url)}
 ${flags}
@@ -113,6 +120,7 @@ if [[ -d "$native_profile/projects" ]]; then
 fi
 export CLAUDE_CONFIG_DIR="$profile"
 
+set -- --model ${shellQuote(OPUS_FAST_MODEL)} --settings '{"fastMode":true,"fastModePerSessionOptIn":false,"fallbackModel":[],"switchModelsOnFlag":false}' "$@"
 exec claude "$@"
 `
 }

@@ -13,8 +13,13 @@ import { addClient, createSetup, refreshClient, renderLauncher } from '../src/sc
 
 const flags = {
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-  CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
-  CLAUDE_CODE_DISABLE_FAST_MODE: '1',
+  CLAUDE_CODE_SKIP_FAST_MODE_NETWORK_ERRORS: '1',
+  ANTHROPIC_MODEL: 'claude-opus-5-5',
+  ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-5-5',
+  ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-opus-5-5',
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-opus-5-5',
+  ANTHROPIC_SMALL_FAST_MODEL: 'claude-opus-5-5',
+  CLAUDE_CODE_SUBAGENT_MODEL: 'claude-opus-5-5',
   CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1',
   CLAUDE_CODE_GATEWAY_HINT_HEADERS: '0',
   CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
@@ -23,6 +28,7 @@ const cleared = [
   'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'CC_GATEWAY_UPSTREAM_API_KEY',
   'ANTHROPIC_CUSTOM_HEADERS', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_ENABLE_TELEMETRY', 'NODE_TLS_REJECT_UNAUTHORIZED',
+  'CLAUDE_CODE_DISABLE_FAST_MODE', 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
 ]
 
 function fixture(t: TestContext): string {
@@ -63,6 +69,7 @@ console.log(JSON.stringify({pid: process.pid, args: process.argv.slice(2), cwd: 
     ANTHROPIC_API_KEY: 'unrelated-api-key',
     ANTHROPIC_BASE_URL: 'https://unrelated.example',
   }
+  for (const name of Object.keys(flags)) env[name] = 'inherited-override'
   for (const name of cleared) env[name] = 'inherited-value-must-not-reach-claude'
   env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
   return env
@@ -95,9 +102,11 @@ test('launcher preserves arguments, cwd and process identity while removing inhe
   assert.equal(child.status, 0, child.stderr)
   const captured = JSON.parse(child.stdout)
   assert.equal(captured.pid, child.pid)
-  assert.deepEqual(captured.args, args)
+  assert.deepEqual(captured.args.slice(0, 3), ['--model', 'claude-opus-5-5', '--settings'])
+  assert.deepEqual(JSON.parse(captured.args[3]), { fastMode: true, fastModePerSessionOptIn: false, fallbackModel: [], switchModelsOnFlag: false })
+  assert.deepEqual(captured.args.slice(4), args)
   assert.equal(captured.cwd, cwd)
-  assert.equal(captured.env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:8443/agent-v2')
+  assert.equal(captured.env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:8443/opus-fast')
   assert.equal(captured.env.CLAUDE_CONFIG_DIR, join(directory, '.local/share/cc-gateway/claude'))
   assert.equal(captured.env.ANTHROPIC_API_KEY, config(directory).auth.tokens[0].token)
   for (const [name, value] of Object.entries(flags)) assert.equal(captured.env[name], value, name)
@@ -133,7 +142,7 @@ test('launcher quotes tokens and validates HTTPS without disabling certificate c
   assert.equal(child.status, 0, child.stderr)
   const captured = JSON.parse(child.stdout)
   assert.equal(captured.env.ANTHROPIC_API_KEY, token)
-  assert.equal(captured.env.ANTHROPIC_BASE_URL, 'https://gateway.example:9443/agent-v2')
+  assert.equal(captured.env.ANTHROPIC_BASE_URL, 'https://gateway.example:9443/opus-fast')
   assert.equal(captured.env.NODE_TLS_REJECT_UNAUTHORIZED, null)
   // A token whose suffix is not plain text is never embedded in seeded JSON.
   assert.equal(existsSync(join(directory, '.local/share/cc-gateway/claude/.claude.json')), false)
@@ -280,7 +289,7 @@ test('resume sees native transcripts and artifacts without sharing credentials o
   writeFileSync(join(native, 'sessions', 'process.key'), 'private IPC credential')
   const child = spawnSync(launcher, ['--resume', id], { cwd: directory, env, encoding: 'utf8' })
   assert.equal(child.status, 0, child.stderr)
-  assert.deepEqual(JSON.parse(child.stdout).args, ['--resume', id])
+  assert.deepEqual(JSON.parse(child.stdout).args.slice(4), ['--resume', id])
   const profile = join(directory, '.local/share/cc-gateway/claude')
   const linked = join(profile, 'projects', '-project', `${id}.jsonl`)
   assert.ok(lstatSync(linked).isFile())
@@ -340,9 +349,9 @@ test('refresh-client updates only a recognized launcher and preserves its token'
   const directory = fixture(t)
   const launcher = createSetup(directory, 'first')
   const before = readFileSync(join(directory, 'config.yaml'), 'utf8')
-  writeFileSync(launcher, readFileSync(launcher, 'utf8').replace('8443/agent-v2', '8443/agent'))
+  writeFileSync(launcher, readFileSync(launcher, 'utf8').replace('8443/opus-fast', '8443/agent'))
   assert.equal(refreshClient(directory, 'first'), launcher)
-  assert.match(readFileSync(launcher, 'utf8'), /8443\/agent-v2/)
+  assert.match(readFileSync(launcher, 'utf8'), /8443\/opus-fast/)
   assert.equal(readFileSync(join(directory, 'config.yaml'), 'utf8'), before)
   writeFileSync(launcher, '#!/bin/sh\nexit 0\n')
   assert.throws(() => refreshClient(directory, 'first'), /unrecognized/)

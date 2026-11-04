@@ -1,5 +1,6 @@
 import { applyEdits, getNodeValue, modify, parseTree, type Edit, type Node as JsonNode, type ParseError } from 'jsonc-parser'
 import { rewriteGeneratedContext } from './context.js'
+import { pinOpusFast } from './inference.js'
 import { createWireCodec, type WireCodec } from './wire-profile.js'
 import { curateToolSchema, TOOL_DESCRIPTIONS } from './tool-descriptions.js'
 import { promisify } from 'util'
@@ -271,14 +272,15 @@ export async function rewriteRequestBody(body: Buffer, pathname: string, encodin
   return transformBody(body, encoding, maxBytes, rewriteJson)
 }
 
-export async function prepareNeutralRequest(body: Buffer, pathname: string, encoding: string | undefined, maxBytes: number, profileId: 'neutral-v1' | 'neutral-v2' = 'neutral-v1'): Promise<{ body: Buffer; codec: WireCodec }> {
+export async function prepareNeutralRequest(body: Buffer, pathname: string, encoding: string | undefined, maxBytes: number, profileId: 'neutral-v1' | 'neutral-v2' = 'neutral-v1', opusFast = false): Promise<{ body: Buffer; codec: WireCodec }> {
   if (pathname !== '/v1/messages' && pathname !== '/v1/messages/count_tokens') return { body, codec: createWireCodec({}, profileId) }
   let codec: WireCodec | undefined
   const output = await transformBody(body, encoding, maxBytes, text => {
     const result = rewriteNeutralJson(text, profileId)
     codec = result.codec
-    if (Buffer.byteLength(result.text) > maxBytes) throw new BodyError(413, 'Rewritten request body is too large')
-    return result.text
+    const rewritten = opusFast ? pinOpusFast(result.text, pathname) : result.text
+    if (Buffer.byteLength(rewritten) > maxBytes) throw new BodyError(413, 'Rewritten request body is too large')
+    return rewritten
   })
   return { body: output, codec: codec! }
 }
